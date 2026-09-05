@@ -71,6 +71,86 @@ class VendorRoutingTests(unittest.TestCase):
             result = interface.route_to_vendor("get_stock_data", "AAPL", "2026-01-01", "2026-01-10")
         self.assertEqual(result, "AV_DATA")
 
+    def test_error_string_falls_back_within_configured_chain(self):
+        set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
+        with self._route({
+            "yfinance": _returns("Error retrieving stock data: upstream failed"),
+            "alpha_vantage": _returns("AV_DATA"),
+        }):
+            result = interface.route_to_vendor(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+        self.assertEqual(result, "AV_DATA")
+
+    def test_single_provider_error_string_becomes_data_unavailable(self):
+        set_config({"data_vendors": {"fundamental_data": "yfinance"}})
+        with self._route_method(
+            "get_income_statement",
+            {"yfinance": _returns("Error retrieving income statement: upstream failed")},
+        ):
+            result = interface.route_to_vendor(
+                "get_income_statement", "NVDA", "quarterly", "2026-09-05"
+            )
+        self.assertTrue(result.startswith("DATA_UNAVAILABLE:"))
+        self.assertIn("fundamental_data", result)
+        self.assertNotIn("upstream failed", result)
+
+    def test_recent_quarterly_result_avoids_unnecessary_fallback(self):
+        set_config({"data_vendors": {"fundamental_data": "yfinance,alpha_vantage"}})
+        fallback = mock.Mock(return_value="unused")
+        recent = ",2026-07-27\nRevenue,1\n"
+        with self._route_method(
+            "get_income_statement",
+            {"yfinance": _returns(recent), "alpha_vantage": fallback},
+        ):
+            result = interface.route_to_vendor(
+                "get_income_statement", "NVDA", "quarterly", "2026-09-05"
+            )
+        self.assertIn("Freshness status: RECENT", result)
+        fallback.assert_not_called()
+
+    def test_stale_quarterly_fallback_prefers_newer_period(self):
+        set_config({"data_vendors": {"fundamental_data": "yfinance,alpha_vantage"}})
+        older = ",2026-04-27\nRevenue,1\n"
+        newer = ",2026-05-01\nRevenue,2\n"
+        with self._route_method(
+            "get_income_statement",
+            {"yfinance": _returns(older), "alpha_vantage": _returns(newer)},
+        ):
+            result = interface.route_to_vendor(
+                "get_income_statement", "NVDA", "quarterly", "2026-09-05"
+            )
+        self.assertIn("Source provider: alpha_vantage", result)
+        self.assertIn("Newest retrieved reporting period: 2026-05-01", result)
+
+    def test_unknown_quarterly_fallback_prefers_parseable_period(self):
+        set_config({"data_vendors": {"fundamental_data": "yfinance,alpha_vantage"}})
+        parseable = ",2026-04-27\nRevenue,2\n"
+        with self._route_method(
+            "get_income_statement",
+            {"yfinance": _returns("unparseable"), "alpha_vantage": _returns(parseable)},
+        ):
+            result = interface.route_to_vendor(
+                "get_income_statement", "NVDA", "quarterly", "2026-09-05"
+            )
+        self.assertIn("Source provider: alpha_vantage", result)
+        self.assertIn("Newest retrieved reporting period: 2026-04-27", result)
+
+    def test_stale_quarterly_keeps_original_when_fallback_is_not_fresher(self):
+        set_config({"data_vendors": {"fundamental_data": "yfinance,alpha_vantage"}})
+        original = ",2026-04-27\nRevenue,1\n"
+        older = ",2026-01-26\nRevenue,2\n"
+        with self._route_method(
+            "get_income_statement",
+            {"yfinance": _returns(original), "alpha_vantage": _returns(older)},
+        ):
+            result = interface.route_to_vendor(
+                "get_income_statement", "NVDA", "quarterly", "2026-09-05"
+            )
+        self.assertIn("Source provider: yfinance", result)
+        self.assertIn("Newest retrieved reporting period: 2026-04-27", result)
+        self.assertIn("WARNING:", result)
+
     def test_primary_error_is_logged_not_masked(self):
         # #989: primary errors + fallback no-data -> NO_DATA, but the failure
         # must be visible in logs (broken primary not hidden).

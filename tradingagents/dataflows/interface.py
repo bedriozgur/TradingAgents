@@ -18,6 +18,7 @@ from .errors import (
     VendorRateLimitError,
 )
 from .fred import get_macro_data as get_fred_macro_data
+from .fundamentals_freshness import QuarterlyResultAssessment, assess_quarterly_result
 from .polymarket import get_prediction_markets as get_polymarket_prediction_markets
 from .y_finance import (
     get_balance_sheet as get_yfinance_balance_sheet,
@@ -31,6 +32,10 @@ from .y_finance import (
 from .yfinance_news import get_global_news_yfinance, get_news_yfinance
 
 logger = logging.getLogger(__name__)
+
+
+class VendorReturnedError(RuntimeError):
+    """A provider returned an error message as data instead of raising it."""
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
@@ -194,12 +199,29 @@ def route_to_vendor(method: str, *args, **kwargs):
 
     last_no_data: NoMarketDataError | None = None
     first_error: Exception | None = None
+    best_quarterly: QuarterlyResultAssessment | None = None
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            return impl_func(*args, **kwargs)
+            result = impl_func(*args, **kwargs)
+            if isinstance(result, str) and result.lstrip().lower().startswith("error"):
+                raise VendorReturnedError(result.strip())
+            assessment = assess_quarterly_result(method, vendor, result, args, kwargs)
+            if assessment is None:
+                return result
+            if assessment.status == "RECENT":
+                return assessment.output
+            if (
+                best_quarterly is None
+                or assessment.newest_period is not None
+                and (
+                    best_quarterly.newest_period is None
+                    or assessment.newest_period > best_quarterly.newest_period
+                )
+            ):
+                best_quarterly = assessment
         except VendorRateLimitError:
             logger.warning("Vendor %r rate-limited for %s; trying next vendor.", vendor, method)
             continue
@@ -219,6 +241,12 @@ def route_to_vendor(method: str, *args, **kwargs):
             if first_error is None:
                 first_error = e
             continue
+
+    # A stale/unknown quarterly result remains usable with its warning. Prefer
+    # the newest parseable successful result, but preserve the first result when
+    # no configured fallback supplied a demonstrably fresher period.
+    if best_quarterly is not None:
+        return best_quarterly.output
 
     # If any vendor reported "no data", the symbol is genuinely unavailable.
     # Return one explicit, instructive sentinel rather than a vendor-specific
@@ -251,11 +279,11 @@ def route_to_vendor(method: str, *args, **kwargs):
     # enrichment categories degrade to a sentinel instead, so flavour data can't
     # abort the run.
     if first_error is not None:
-        if category in OPTIONAL_CATEGORIES:
-            logger.warning("Optional %s unavailable for %s: %s", category, method, first_error)
+        if category in OPTIONAL_CATEGORIES or isinstance(first_error, VendorReturnedError):
+            logger.warning("%s unavailable for %s: %s", category, method, first_error)
             return (
-                f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
-                f"({first_error}). Proceed without it; do not fabricate values."
+                f"DATA_UNAVAILABLE: {category} could not be retrieved from any configured "
+                "vendor. Proceed without it; do not fabricate values."
             )
         raise first_error
 
